@@ -1,262 +1,83 @@
 pipeline {
 
-    /*********************************************************
-     * AGENT
-     * -------------------------------------------------------
-     * Specifies where this pipeline will run.
-     * "any" means Jenkins can execute on any available agent.
-     *********************************************************/
     agent any
 
-    /*********************************************************
-     * PARAMETERS
-     * -------------------------------------------------------
-     * These options appear when clicking
-     * "Build with Parameters" in Jenkins.
-     *
-     * BRANCH:
-     *   Select which Git branch to deploy.
-     *
-     * ENVIRONMENT:
-     *   Select which Kubernetes namespace to deploy.
-     *********************************************************/
-    parameters {
-
-        choice(
-            name: 'BRANCH',
-            choices: ['dev', 'preprod', 'main'],
-            description: 'Select Git Branch'
-        )
-
-        choice(
-            name: 'ENVIRONMENT',
-            choices: ['IND', 'US'],
-            description: 'Select Deployment Environment'
-        )
-
-    }
-
-    /*********************************************************
-     * ENVIRONMENT VARIABLES
-     * -------------------------------------------------------
-     * These variables are available throughout the pipeline.
-     *********************************************************/
     environment {
 
         // GitHub Repository
         GIT_URL = 'https://github.com/mmuthukrishnan2003/BINGO.git'
 
-        // Deployment Server IP
-        SERVER_IP = '172.16.0.111'
+        // Fixed Branch
+        GIT_BRANCH = 'main'
 
-        // SSH Login User
+        // Deployment Server
+        SERVER_IP = '172.16.0.111'
         SERVER_USER = 'demo'
 
-        // Jenkins Credentials ID
-        // Manage Jenkins -> Credentials
+        // Jenkins SSH Credentials ID
         SSH_CREDENTIALS = 'ubuntu-server'
 
-        // Docker Image Name
+        // Docker Image
         IMAGE_NAME = 'demo/frontend'
 
         // Kubernetes Namespace
-        // This value is assigned later.
-        KUBE_NAMESPACE = ''
-
+        KUBE_NAMESPACE = 'india'
     }
 
-    /*********************************************************
-     * STAGES
-     *********************************************************/
     stages {
 
-        /******************************************************
-         * STAGE 1
-         * SELECT ENVIRONMENT
-         ******************************************************/
-        stage('Select Environment') {
-
-            steps {
-
-                script {
-
-                    // If user selects IND
-                    // Namespace = india
-
-                    if (params.ENVIRONMENT == 'IND') {
-
-                        env.KUBE_NAMESPACE = 'india'
-
-                    }
-
-                    // If user selects US
-                    // Namespace = us
-
-                    else {
-
-                        env.KUBE_NAMESPACE = 'us'
-
-                    }
-
-                    echo "================================"
-                    echo "Selected Branch      : ${params.BRANCH}"
-                    echo "Selected Environment : ${params.ENVIRONMENT}"
-                    echo "Namespace            : ${env.KUBE_NAMESPACE}"
-                    echo "================================"
-
-                }
-
-            }
-
-        }
-
-        /******************************************************
-         * STAGE 2
-         * DOWNLOAD SOURCE CODE
-         ******************************************************/
         stage('Checkout Source') {
 
             steps {
 
-                /*
-                 * Download the selected Git branch
-                 * Example:
-                 *
-                 * main
-                 * dev
-                 * preprod
-                 */
-
                 checkout([
-
                     $class: 'GitSCM',
-
-                    branches: [[
-
-                        name: "*/${params.BRANCH}"
-
-                    ]],
-
+                    branches: [[name: "*/${env.GIT_BRANCH}"]],
                     userRemoteConfigs: [[
-
                         url: env.GIT_URL
-
                     ]]
-
                 ])
 
             }
 
         }
 
-        /******************************************************
-         * STAGE 3
-         * BUILD DOCKER IMAGE
-         ******************************************************/
         stage('Docker Build') {
 
             steps {
 
-                /*
-                 * Build Docker Image
-                 *
-                 * Example:
-                 *
-                 * demo/frontend:15
-                 */
-
                 sh """
-
-                docker build \
-                -t ${IMAGE_NAME}:${BUILD_NUMBER} .
-
+                docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
                 """
 
             }
 
         }
 
-        /******************************************************
-         * STAGE 4
-         * DEPLOY APPLICATION
-         ******************************************************/
         stage('Deploy') {
 
             steps {
 
-                /*
-                 * Login to Deployment Server
-                 * using Jenkins SSH Credentials
-                 */
-
                 sshagent(credentials: [env.SSH_CREDENTIALS]) {
 
                     sh """
-
                     ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} '
-
-                    #################################################
-                    # Go to Project Directory
-                    #################################################
 
                     cd /home/demo/BINGO
 
-                    #################################################
-                    # Change Git Branch
-                    #################################################
+                    git checkout ${GIT_BRANCH}
 
-                    git checkout ${params.BRANCH}
+                    git pull origin ${GIT_BRANCH}
 
-                    #################################################
-                    # Download Latest Code
-                    #################################################
+                    docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
 
-                    git pull origin ${params.BRANCH}
+                    kubectl apply -n ${KUBE_NAMESPACE} -f kubernetes/
 
-                    #################################################
-                    # Build Docker Image
-                    #################################################
+                    kubectl rollout restart deployment/frontend -n ${KUBE_NAMESPACE}
 
-                    docker build \
-                    -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+                    kubectl rollout status deployment/frontend -n ${KUBE_NAMESPACE}
 
-                    #################################################
-                    # Deploy Kubernetes YAML Files
-                    #################################################
-
-                    kubectl apply \
-                    -n ${KUBE_NAMESPACE} \
-                    -f kubernetes/
-
-                    #################################################
-                    # Restart Deployment
-                    #################################################
-
-                    kubectl rollout restart \
-                    deployment/frontend \
-                    -n ${KUBE_NAMESPACE}
-
-                    #################################################
-                    # Wait Until Deployment Completes
-                    #################################################
-
-                    kubectl rollout status \
-                    deployment/frontend \
-                    -n ${KUBE_NAMESPACE}
-
-                    #################################################
-                    # Show Running Pods
-                    #################################################
-
-                    kubectl get pods \
-                    -n ${KUBE_NAMESPACE}
-
-                    #################################################
-                    # Show Running Services
-                    #################################################
-
-                    kubectl get svc \
-                    -n ${KUBE_NAMESPACE}
+                    kubectl get pods -n ${KUBE_NAMESPACE}
 
                     '
 
@@ -270,32 +91,18 @@ pipeline {
 
     }
 
-    /*********************************************************
-     * POST SECTION
-     * -------------------------------------------------------
-     * Executes after all stages finish.
-     *********************************************************/
     post {
 
         success {
-
-            // Runs only if pipeline succeeds
             echo "Deployment Successful"
-
         }
 
         failure {
-
-            // Runs only if pipeline fails
             echo "Deployment Failed"
-
         }
 
         always {
-
-            // Runs every time
             echo "Pipeline Completed"
-
         }
 
     }
