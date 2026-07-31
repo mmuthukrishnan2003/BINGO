@@ -4,87 +4,73 @@ pipeline {
 
     environment {
 
-        // GitHub Repository
-        GIT_URL = 'https://github.com/mmuthukrishnan2003/BINGO.git'
+        APP_NAME = "bingo"
 
-        // Fixed Branch
-        GIT_BRANCH = 'main'
+        IMAGE_NAME = "bingo-backend"
 
-        // Deployment Server
-        SERVER_IP = '172.16.0.111'
-        SERVER_USER = 'demo'
+        CONTAINER_NAME = "bingo"
 
-        // Jenkins SSH Credentials ID
-        SSH_CREDENTIALS = 'ubuntu-server'
+        PORT = "3001"
 
-        // Docker Image
-        IMAGE_NAME = 'demo/frontend'
-
-        // Kubernetes Namespace
-        KUBE_NAMESPACE = 'india'
     }
 
     stages {
 
-        stage('Checkout Source') {
+        stage('Checkout') {
 
             steps {
 
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: "*/${env.GIT_BRANCH}"]],
-                    userRemoteConfigs: [[
-                        url: env.GIT_URL
-                    ]]
-                ])
+                checkout scm
 
             }
 
         }
 
-        stage('Docker Build') {
+        stage('Build Docker Image') {
 
             steps {
 
                 sh """
-                docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+                docker build -t ${IMAGE_NAME}:latest .
                 """
-
             }
 
         }
 
-        stage('Deploy') {
+        stage('Stop Old Container') {
 
             steps {
 
-                sshagent(credentials: [env.SSH_CREDENTIALS]) {
+                sh """
+                docker stop ${CONTAINER_NAME} || true
+                docker rm ${CONTAINER_NAME} || true
+                """
+            }
 
-                    sh """
-                    ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} '
+        }
 
-                    cd /home/demo/BINGO
+        stage('Run Container') {
 
-                    git checkout ${GIT_BRANCH}
+            steps {
 
-                    git pull origin ${GIT_BRANCH}
+                sh """
+                docker run -d \
+                --name ${CONTAINER_NAME} \
+                -p ${PORT}:3000 \
+                ${IMAGE_NAME}:latest
+                """
+            }
 
-                    docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+        }
 
-                    kubectl apply -n ${KUBE_NAMESPACE} -f kubernetes/
+        stage('Verify Deployment') {
 
-                    kubectl rollout restart deployment/frontend -n ${KUBE_NAMESPACE}
+            steps {
 
-                    kubectl rollout status deployment/frontend -n ${KUBE_NAMESPACE}
-
-                    kubectl get pods -n ${KUBE_NAMESPACE}
-
-                    '
-
-                    """
-
-                }
-
+                sh """
+                docker ps
+                docker logs ${CONTAINER_NAME} --tail 20
+                """
             }
 
         }
@@ -94,15 +80,15 @@ pipeline {
     post {
 
         success {
+
             echo "Deployment Successful"
+
         }
 
         failure {
-            echo "Deployment Failed"
-        }
 
-        always {
-            echo "Pipeline Completed"
+            echo "Deployment Failed"
+
         }
 
     }
