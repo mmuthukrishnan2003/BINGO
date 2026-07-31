@@ -22,7 +22,7 @@ pipeline {
         // ============================
         // Git Repository
         // ============================
-        GIT_URL = "https://gitlab.com/your-project.git"
+        GIT_URL = "GIT_URL = "https://github.com/mmuthukrishnan2003/BINGO.git""
 
         // ============================
         // Deployment Server
