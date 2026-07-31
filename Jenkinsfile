@@ -6,74 +6,73 @@ pipeline {
 
         choice(
             name: 'BRANCH',
-            choices: ['dev','preprod','main'],
-            description: 'Git Branch'
+            choices: ['dev', 'preprod', 'main'],
+            description: 'Select Git Branch'
         )
 
         choice(
-            name: 'APPLICATION',
-            choices: ['frontend','backend','both'],
-            description: 'Application'
+            name: 'ENVIRONMENT',
+            choices: ['IND', 'US'],
+            description: 'Select Deployment Environment'
         )
-
     }
 
     environment {
 
-        //==============================
-        // Frontend Server
-        //==============================
+        // ============================
+        // Git Repository
+        // ============================
+        GIT_URL = "https://gitlab.com/your-project.git"
 
-        FRONTEND_SERVER = "172.16.0.111"
+        // ============================
+        // Deployment Server
+        // ============================
+        SERVER_IP = "172.16.0.111"
+        SERVER_USER = "demo"
 
-        //==============================
-        // Backend Server
-        //==============================
-
-        BACKEND_SERVER = "172.16.0.112"
-
-        //==============================
+        // ============================
         // Jenkins Credential ID
-        //==============================
-
+        // Manage Jenkins -> Credentials
+        // Username : demo
+        // Password : ****
+        // ID : ubuntu-server
+        // ============================
         SSH_CREDENTIALS = "ubuntu-server"
 
-        //==============================
+        // ============================
         // Docker Image
-        //==============================
+        // ============================
+        IMAGE_NAME = "demo/frontend"
 
-        IMAGE_NAME="demo/frontend"
-
-        ENV_NAME=""
+        // ============================
+        // Kubernetes Namespace
+        // ============================
+        KUBE_NAMESPACE = ""
     }
 
     stages {
 
-        //---------------------------------------
-        // Environment Selection
-        //---------------------------------------
-
-        stage('Set Environment') {
+        stage('Select Environment') {
 
             steps {
 
                 script {
 
-                    if(params.BRANCH=="dev"){
-                        env.ENV_NAME="DEV"
+                    if (params.ENVIRONMENT == "IND") {
+
+                        env.KUBE_NAMESPACE = "india"
+
+                    } else {
+
+                        env.KUBE_NAMESPACE = "us"
+
                     }
 
-                    else if(params.BRANCH=="preprod"){
-                        env.ENV_NAME="PREPROD"
-                    }
-
-                    else{
-                        env.ENV_NAME="PROD"
-                    }
-
-                    echo "Branch : ${params.BRANCH}"
-                    echo "Environment : ${env.ENV_NAME}"
-                    echo "Application : ${params.APPLICATION}"
+                    echo "==============================="
+                    echo "Branch      : ${params.BRANCH}"
+                    echo "Environment : ${params.ENVIRONMENT}"
+                    echo "Namespace   : ${env.KUBE_NAMESPACE}"
+                    echo "==============================="
 
                 }
 
@@ -81,28 +80,22 @@ pipeline {
 
         }
 
-        //---------------------------------------
-        // Checkout
-        //---------------------------------------
+        stage('Checkout Source') {
 
-        stage('Checkout'){
+            steps {
 
-            steps{
-
-                git branch: params.BRANCH,
-                url:'https://gitlab.com/demo/project.git'
+                git(
+                    branch: params.BRANCH,
+                    url: env.GIT_URL
+                )
 
             }
 
         }
 
-        //---------------------------------------
-        // Docker Build
-        //---------------------------------------
+        stage('Build Docker Image') {
 
-        stage('Docker Build'){
-
-            steps{
+            steps {
 
                 sh """
 
@@ -115,32 +108,25 @@ pipeline {
 
         }
 
-        //---------------------------------------
-        // Deploy Frontend
-        //---------------------------------------
+        stage('Deploy To Kubernetes') {
 
-        stage('Deploy Frontend'){
+            steps {
 
-            when{
-
-                expression{
-
-                    params.APPLICATION=="frontend" ||
-                    params.APPLICATION=="both"
-
-                }
-
-            }
-
-            steps{
-
-                sshagent(credentials:[SSH_CREDENTIALS]){
+                sshagent(credentials: [SSH_CREDENTIALS]) {
 
                     sh """
 
-                    ssh demo@${FRONTEND_SERVER} '
+                    ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} '
 
-                    kubectl apply -f /home/demo/project/kubernetes/
+                    cd /home/demo/project
+
+                    docker load < frontend.tar || true
+
+                    kubectl apply -n ${KUBE_NAMESPACE} -f kubernetes/
+
+                    kubectl rollout restart deployment/frontend -n ${KUBE_NAMESPACE}
+
+                    kubectl get pods -n ${KUBE_NAMESPACE}
 
                     '
 
@@ -152,40 +138,25 @@ pipeline {
 
         }
 
-        //---------------------------------------
-        // Deploy Backend
-        //---------------------------------------
+    }
 
-        stage('Deploy Backend'){
+    post {
 
-            when{
+        success {
 
-                expression{
+            echo "Deployment Completed Successfully"
 
-                    params.APPLICATION=="backend" ||
-                    params.APPLICATION=="both"
+        }
 
-                }
+        failure {
 
-            }
+            echo "Deployment Failed"
 
-            steps{
+        }
 
-                sshagent(credentials:[SSH_CREDENTIALS]){
+        always {
 
-                    sh """
-
-                    ssh demo@${BACKEND_SERVER} '
-
-                    kubectl apply -f /home/demo/project/kubernetes/
-
-                    '
-
-                    """
-
-                }
-
-            }
+            echo "Pipeline Finished"
 
         }
 
