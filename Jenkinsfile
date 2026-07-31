@@ -1,18 +1,25 @@
 pipeline {
 
+    /******************************************************
+     * AGENT
+     * Jenkins will execute this pipeline on any available agent.
+     ******************************************************/
     agent any
 
     /******************************************************
-     * BUILD PARAMETERS
+     * PARAMETERS
+     * These options appear in "Build with Parameters".
      ******************************************************/
     parameters {
 
+        // Select the Git branch to deploy
         choice(
             name: 'BRANCH',
             choices: ['dev', 'preprod', 'main'],
             description: 'Select Git Branch'
         )
 
+        // Select the deployment environment
         choice(
             name: 'ENVIRONMENT',
             choices: ['IND', 'US'],
@@ -22,31 +29,31 @@ pipeline {
 
     /******************************************************
      * ENVIRONMENT VARIABLES
+     * Common values used throughout the pipeline.
      ******************************************************/
     environment {
 
-        // Git Repository
+        // GitHub Repository URL
         GIT_URL = 'https://github.com/mmuthukrishnan2003/BINGO.git'
 
-        // Deployment Server
+        // Deployment Server IP
         SERVER_IP = '172.16.0.111'
+
+        // SSH User for the server
         SERVER_USER = 'demo'
 
         // Jenkins Credentials ID
-        // Manage Jenkins -> Credentials -> Global
+        // Manage Jenkins → Credentials → Global
         SSH_CREDENTIALS = 'ubuntu-server'
 
         // Docker Image Name
         IMAGE_NAME = 'demo/frontend'
-
-        // Namespace (will be set dynamically)
-        KUBE_NAMESPACE = ''
     }
 
     stages {
 
         /******************************************************
-         * SELECT NAMESPACE
+         * STAGE 1 : SELECT ENVIRONMENT
          ******************************************************/
         stage('Select Environment') {
 
@@ -54,17 +61,23 @@ pipeline {
 
                 script {
 
+                    /*
+                     * Map the selected environment
+                     * IND -> india namespace
+                     * US  -> us namespace
+                     */
+
                     if (params.ENVIRONMENT == 'IND') {
                         env.KUBE_NAMESPACE = 'india'
                     } else {
                         env.KUBE_NAMESPACE = 'us'
                     }
 
-                    echo "====================================="
+                    echo "=============================="
                     echo "Branch      : ${params.BRANCH}"
                     echo "Environment : ${params.ENVIRONMENT}"
                     echo "Namespace   : ${env.KUBE_NAMESPACE}"
-                    echo "====================================="
+                    echo "=============================="
 
                 }
 
@@ -73,15 +86,23 @@ pipeline {
         }
 
         /******************************************************
-         * CHECKOUT SOURCE CODE
+         * STAGE 2 : CHECKOUT SOURCE CODE
          ******************************************************/
-        stage('Checkout') {
+        stage('Checkout Source') {
 
             steps {
 
+                /*
+                 * Download the selected Git branch.
+                 */
+
                 checkout([
                     $class: 'GitSCM',
-                    branches: [[name: "*/${params.BRANCH}"]],
+
+                    branches: [[
+                        name: "*/${params.BRANCH}"
+                    ]],
+
                     userRemoteConfigs: [[
                         url: env.GIT_URL
                     ]]
@@ -92,14 +113,21 @@ pipeline {
         }
 
         /******************************************************
-         * BUILD DOCKER IMAGE
+         * STAGE 3 : BUILD DOCKER IMAGE
          ******************************************************/
         stage('Docker Build') {
 
             steps {
 
+                /*
+                 * Build Docker image.
+                 */
+
                 sh """
-                docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+
+                docker build \
+                -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+
                 """
 
             }
@@ -107,33 +135,42 @@ pipeline {
         }
 
         /******************************************************
-         * DEPLOY TO SERVER
+         * STAGE 4 : DEPLOY TO SERVER
          ******************************************************/
         stage('Deploy') {
 
             steps {
 
+                /*
+                 * Use Jenkins SSH Credentials
+                 */
+
                 sshagent(credentials: [env.SSH_CREDENTIALS]) {
 
                     sh """
-                    ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} << EOF
+
+                    ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} '
+
+                    echo "Connected Successfully"
 
                     cd /home/demo/project
 
-                    # Pull latest code
                     git checkout ${params.BRANCH}
+
                     git pull origin ${params.BRANCH}
 
-                    # Deploy Kubernetes
-                    kubectl apply -n ${KUBE_NAMESPACE} -f kubernetes/
+                    kubectl apply \
+                    -n ${KUBE_NAMESPACE} \
+                    -f kubernetes/
 
-                    # Restart Deployment
-                    kubectl rollout restart deployment/frontend -n ${KUBE_NAMESPACE}
+                    kubectl rollout restart deployment/frontend \
+                    -n ${KUBE_NAMESPACE}
 
-                    # Show Pods
-                    kubectl get pods -n ${KUBE_NAMESPACE}
+                    kubectl get pods \
+                    -n ${KUBE_NAMESPACE}
 
-                    EOF
+                    '
+
                     """
 
                 }
