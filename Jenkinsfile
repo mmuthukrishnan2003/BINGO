@@ -1,64 +1,300 @@
-/******************************************************
- * STAGE 4 : DEPLOY TO SERVER
- ******************************************************/
-stage('Deploy') {
+pipeline {
 
-    steps {
+    /*********************************************************
+     * AGENT
+     * -------------------------------------------------------
+     * Specifies where this pipeline will run.
+     * "any" means Jenkins can execute on any available agent.
+     *********************************************************/
+    agent any
 
-        // Use SSH credentials stored in Jenkins
-        sshagent(credentials: [env.SSH_CREDENTIALS]) {
+    /*********************************************************
+     * PARAMETERS
+     * -------------------------------------------------------
+     * These options appear when clicking
+     * "Build with Parameters" in Jenkins.
+     *
+     * BRANCH:
+     *   Select which Git branch to deploy.
+     *
+     * ENVIRONMENT:
+     *   Select which Kubernetes namespace to deploy.
+     *********************************************************/
+    parameters {
 
-            sh """
+        choice(
+            name: 'BRANCH',
+            choices: ['dev', 'preprod', 'main'],
+            description: 'Select Git Branch'
+        )
 
-            ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} '
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['IND', 'US'],
+            description: 'Select Deployment Environment'
+        )
 
-            echo "======================================="
-            echo "Connected to Server Successfully"
-            echo "======================================="
+    }
 
-            # Go to the Git project
-            cd /home/demo/BINGO
+    /*********************************************************
+     * ENVIRONMENT VARIABLES
+     * -------------------------------------------------------
+     * These variables are available throughout the pipeline.
+     *********************************************************/
+    environment {
 
-            # Show current working directory
-            pwd
+        // GitHub Repository
+        GIT_URL = 'https://github.com/mmuthukrishnan2003/BINGO.git'
 
-            # Display available branches
-            git branch -a
+        // Deployment Server IP
+        SERVER_IP = '172.16.0.111'
 
-            # Checkout selected branch
-            git checkout ${params.BRANCH}
+        // SSH Login User
+        SERVER_USER = 'demo'
 
-            # Pull latest source code
-            git pull origin ${params.BRANCH}
+        // Jenkins Credentials ID
+        // Manage Jenkins -> Credentials
+        SSH_CREDENTIALS = 'ubuntu-server'
 
-            # Build Docker image
-            docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+        // Docker Image Name
+        IMAGE_NAME = 'demo/frontend'
 
-            # Verify Docker image
-            docker images | grep ${IMAGE_NAME}
+        // Kubernetes Namespace
+        // This value is assigned later.
+        KUBE_NAMESPACE = ''
 
-            # Deploy Kubernetes manifests
-            kubectl apply -n ${env.KUBE_NAMESPACE} -f kubernetes/
+    }
 
-            # Restart Kubernetes deployment
-            kubectl rollout restart deployment/frontend -n ${env.KUBE_NAMESPACE}
+    /*********************************************************
+     * STAGES
+     *********************************************************/
+    stages {
 
-            # Wait until deployment completes
-            kubectl rollout status deployment/frontend -n ${env.KUBE_NAMESPACE}
+        /******************************************************
+         * STAGE 1
+         * SELECT ENVIRONMENT
+         ******************************************************/
+        stage('Select Environment') {
 
-            # Display running pods
-            kubectl get pods -n ${env.KUBE_NAMESPACE}
+            steps {
 
-            # Display services
-            kubectl get svc -n ${env.KUBE_NAMESPACE}
+                script {
 
-            echo "======================================="
-            echo "Deployment Completed Successfully"
-            echo "======================================="
+                    // If user selects IND
+                    // Namespace = india
 
-            '
+                    if (params.ENVIRONMENT == 'IND') {
 
-            """
+                        env.KUBE_NAMESPACE = 'india'
+
+                    }
+
+                    // If user selects US
+                    // Namespace = us
+
+                    else {
+
+                        env.KUBE_NAMESPACE = 'us'
+
+                    }
+
+                    echo "================================"
+                    echo "Selected Branch      : ${params.BRANCH}"
+                    echo "Selected Environment : ${params.ENVIRONMENT}"
+                    echo "Namespace            : ${env.KUBE_NAMESPACE}"
+                    echo "================================"
+
+                }
+
+            }
+
+        }
+
+        /******************************************************
+         * STAGE 2
+         * DOWNLOAD SOURCE CODE
+         ******************************************************/
+        stage('Checkout Source') {
+
+            steps {
+
+                /*
+                 * Download the selected Git branch
+                 * Example:
+                 *
+                 * main
+                 * dev
+                 * preprod
+                 */
+
+                checkout([
+
+                    $class: 'GitSCM',
+
+                    branches: [[
+
+                        name: "*/${params.BRANCH}"
+
+                    ]],
+
+                    userRemoteConfigs: [[
+
+                        url: env.GIT_URL
+
+                    ]]
+
+                ])
+
+            }
+
+        }
+
+        /******************************************************
+         * STAGE 3
+         * BUILD DOCKER IMAGE
+         ******************************************************/
+        stage('Docker Build') {
+
+            steps {
+
+                /*
+                 * Build Docker Image
+                 *
+                 * Example:
+                 *
+                 * demo/frontend:15
+                 */
+
+                sh """
+
+                docker build \
+                -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+
+                """
+
+            }
+
+        }
+
+        /******************************************************
+         * STAGE 4
+         * DEPLOY APPLICATION
+         ******************************************************/
+        stage('Deploy') {
+
+            steps {
+
+                /*
+                 * Login to Deployment Server
+                 * using Jenkins SSH Credentials
+                 */
+
+                sshagent(credentials: [env.SSH_CREDENTIALS]) {
+
+                    sh """
+
+                    ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} '
+
+                    #################################################
+                    # Go to Project Directory
+                    #################################################
+
+                    cd /home/demo/BINGO
+
+                    #################################################
+                    # Change Git Branch
+                    #################################################
+
+                    git checkout ${params.BRANCH}
+
+                    #################################################
+                    # Download Latest Code
+                    #################################################
+
+                    git pull origin ${params.BRANCH}
+
+                    #################################################
+                    # Build Docker Image
+                    #################################################
+
+                    docker build \
+                    -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+
+                    #################################################
+                    # Deploy Kubernetes YAML Files
+                    #################################################
+
+                    kubectl apply \
+                    -n ${KUBE_NAMESPACE} \
+                    -f kubernetes/
+
+                    #################################################
+                    # Restart Deployment
+                    #################################################
+
+                    kubectl rollout restart \
+                    deployment/frontend \
+                    -n ${KUBE_NAMESPACE}
+
+                    #################################################
+                    # Wait Until Deployment Completes
+                    #################################################
+
+                    kubectl rollout status \
+                    deployment/frontend \
+                    -n ${KUBE_NAMESPACE}
+
+                    #################################################
+                    # Show Running Pods
+                    #################################################
+
+                    kubectl get pods \
+                    -n ${KUBE_NAMESPACE}
+
+                    #################################################
+                    # Show Running Services
+                    #################################################
+
+                    kubectl get svc \
+                    -n ${KUBE_NAMESPACE}
+
+                    '
+
+                    """
+
+                }
+
+            }
+
+        }
+
+    }
+
+    /*********************************************************
+     * POST SECTION
+     * -------------------------------------------------------
+     * Executes after all stages finish.
+     *********************************************************/
+    post {
+
+        success {
+
+            // Runs only if pipeline succeeds
+            echo "Deployment Successful"
+
+        }
+
+        failure {
+
+            // Runs only if pipeline fails
+            echo "Deployment Failed"
+
+        }
+
+        always {
+
+            // Runs every time
+            echo "Pipeline Completed"
 
         }
 
