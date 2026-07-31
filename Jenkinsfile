@@ -2,6 +2,9 @@ pipeline {
 
     agent any
 
+    /******************************************************
+     * BUILD PARAMETERS
+     ******************************************************/
     parameters {
 
         choice(
@@ -17,62 +20,51 @@ pipeline {
         )
     }
 
+    /******************************************************
+     * ENVIRONMENT VARIABLES
+     ******************************************************/
     environment {
 
-        // ============================
         // Git Repository
-        // ============================
-        GIT_URL = "GIT_URL = "https://github.com/mmuthukrishnan2003/BINGO.git""
+        GIT_URL = 'https://github.com/mmuthukrishnan2003/BINGO.git'
 
-        // ============================
         // Deployment Server
-        // ============================
-        SERVER_IP = "172.16.0.111"
-        SERVER_USER = "demo"
+        SERVER_IP = '172.16.0.111'
+        SERVER_USER = 'demo'
 
-        // ============================
-        // Jenkins Credential ID
-        // Manage Jenkins -> Credentials
-        // Username : demo
-        // Password : ****
-        // ID : ubuntu-server
-        // ============================
-        SSH_CREDENTIALS = "ubuntu-server"
+        // Jenkins Credentials ID
+        // Manage Jenkins -> Credentials -> Global
+        SSH_CREDENTIALS = 'ubuntu-server'
 
-        // ============================
-        // Docker Image
-        // ============================
-        IMAGE_NAME = "demo/frontend"
+        // Docker Image Name
+        IMAGE_NAME = 'demo/frontend'
 
-        // ============================
-        // Kubernetes Namespace
-        // ============================
-        KUBE_NAMESPACE = ""
+        // Namespace (will be set dynamically)
+        KUBE_NAMESPACE = ''
     }
 
     stages {
 
+        /******************************************************
+         * SELECT NAMESPACE
+         ******************************************************/
         stage('Select Environment') {
 
             steps {
 
                 script {
 
-                    if (params.ENVIRONMENT == "IND") {
-
-                        env.KUBE_NAMESPACE = "india"
-
+                    if (params.ENVIRONMENT == 'IND') {
+                        env.KUBE_NAMESPACE = 'india'
                     } else {
-
-                        env.KUBE_NAMESPACE = "us"
-
+                        env.KUBE_NAMESPACE = 'us'
                     }
 
-                    echo "==============================="
+                    echo "====================================="
                     echo "Branch      : ${params.BRANCH}"
                     echo "Environment : ${params.ENVIRONMENT}"
                     echo "Namespace   : ${env.KUBE_NAMESPACE}"
-                    echo "==============================="
+                    echo "====================================="
 
                 }
 
@@ -80,56 +72,68 @@ pipeline {
 
         }
 
-        stage('Checkout Source') {
+        /******************************************************
+         * CHECKOUT SOURCE CODE
+         ******************************************************/
+        stage('Checkout') {
 
             steps {
 
-                git(
-                    branch: params.BRANCH,
-                    url: env.GIT_URL
-                )
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${params.BRANCH}"]],
+                    userRemoteConfigs: [[
+                        url: env.GIT_URL
+                    ]]
+                ])
 
             }
 
         }
 
-        stage('Build Docker Image') {
+        /******************************************************
+         * BUILD DOCKER IMAGE
+         ******************************************************/
+        stage('Docker Build') {
 
             steps {
 
                 sh """
-
-                docker build \
-                -t ${IMAGE_NAME}:${BUILD_NUMBER} .
-
+                docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
                 """
 
             }
 
         }
 
-        stage('Deploy To Kubernetes') {
+        /******************************************************
+         * DEPLOY TO SERVER
+         ******************************************************/
+        stage('Deploy') {
 
             steps {
 
-                sshagent(credentials: [SSH_CREDENTIALS]) {
+                sshagent(credentials: [env.SSH_CREDENTIALS]) {
 
                     sh """
-
-                    ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} '
+                    ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} << EOF
 
                     cd /home/demo/project
 
-                    docker load < frontend.tar || true
+                    # Pull latest code
+                    git checkout ${params.BRANCH}
+                    git pull origin ${params.BRANCH}
 
+                    # Deploy Kubernetes
                     kubectl apply -n ${KUBE_NAMESPACE} -f kubernetes/
 
+                    # Restart Deployment
                     kubectl rollout restart deployment/frontend -n ${KUBE_NAMESPACE}
 
+                    # Show Pods
                     kubectl get pods -n ${KUBE_NAMESPACE}
 
-                    '
-
+                    EOF
                     """
 
                 }
@@ -140,11 +144,14 @@ pipeline {
 
     }
 
+    /******************************************************
+     * POST ACTIONS
+     ******************************************************/
     post {
 
         success {
 
-            echo "Deployment Completed Successfully"
+            echo "Deployment Successful"
 
         }
 
@@ -156,7 +163,7 @@ pipeline {
 
         always {
 
-            echo "Pipeline Finished"
+            echo "Pipeline Completed"
 
         }
 
