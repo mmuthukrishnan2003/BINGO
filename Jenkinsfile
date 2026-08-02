@@ -23,10 +23,9 @@ pipeline {
     // Global tools & environment variables - adjust names/paths as per
     // your Jenkins Global Tool Configuration and organization standards.
     // --------------------------------------------------------------------
-    tools {
-        maven 'Maven-3.9'      // Example build tool, change to gradle/npm/etc.
-        jdk 'JDK-17'
-    }
+   tools {
+    jdk 'JDK-17'
+}
 
     environment {
         DOCKER_REGISTRY   = 'registry.example.com'
