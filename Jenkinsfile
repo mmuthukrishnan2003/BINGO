@@ -1,311 +1,334 @@
-// ============================================================================
-// Jenkinsfile - CI/CD Pipeline
-// ----------------------------------------------------------------------------
-// Flow:
-// Developer -> Git Push -> Merge Request -> Code Review -> Jenkins Trigger
-//   -> Checkout -> Build -> Unit Test -> SonarQube -> Security Scan
-//   -> Docker Build -> Docker Push -> Deploy DEV -> Health Check
-//   -> QA Approval -> Deploy PREPROD -> Health Check -> Manager Approval
-//   -> Deploy PROD -> Health Check -> Rollback (if required)
-//   -> Slack / Email Notification
+// =====================================================================
+// Jenkinsfile — GitLab -> Jenkins -> Docker -> SSH Deploy pipeline
+// =====================================================================
+// This file implements the flow:
+//   Git Push -> GitLab (main/dev/preprod) -> Webhook -> Jenkins
+//     -> Checkout -> Read Params -> Build -> Unit Tests -> SonarQube
+//     -> Security Scan -> Docker Build -> Docker Push
+//     -> SSH Deploy (pull, stop, remove, run) -> Health Check
+//     -> Success: Slack/Email notify | Failed: Rollback + Notify
 //
-// NOTE: "Developer -> Git Push -> Merge Request -> Code Review" happen
-// outside Jenkins (in Git/GitLab/GitHub). Jenkins picks up the flow from
-// the "Jenkins Trigger" stage onward, normally via a webhook fired once
-// the Merge Request is approved/merged.
-// ============================================================================
+// It's written to be adapted, not copy-pasted blindly:
+//   - Replace values in the `environment` block with your own.
+//   - The pipeline assumes a Node/Java-style build (`npm`/`mvn`) — swap
+//     the Build/Test stage commands for whatever your app uses.
+//   - Credentials are referenced by ID (withCredentials / credentialsId).
+//     Create matching entries in Jenkins > Manage Jenkins > Credentials.
+// =====================================================================
 
 pipeline {
 
+    // Run on any available agent. Pin to a labeled agent (e.g. `docker`)
+    // if you have a dedicated build node with Docker installed.
     agent any
 
-    // --------------------------------------------------------------------
-    // Global tools & environment variables - adjust names/paths as per
-    // your Jenkins Global Tool Configuration and organization standards.
-    // --------------------------------------------------------------------
-tools {
-    jdk 'JDK-17'
-}
+    // -------------------------------------------------------------
+    // PARAMETERS — populated from the GitLab webhook payload or set
+    // manually when a human clicks "Build with Parameters".
+    // -------------------------------------------------------------
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'preprod', 'main'],
+            description: 'Target environment / branch to deploy'
+        )
+        string(
+            name: 'BRANCH_NAME',
+            defaultValue: 'main',
+            description: 'Git branch to checkout'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip unit tests (emergency hotfix only)'
+        )
+    }
+
+    // -------------------------------------------------------------
+    // GLOBAL ENVIRONMENT VARIABLES
+    // -------------------------------------------------------------
     environment {
-        DOCKER_REGISTRY   = 'registry.example.com'
-        IMAGE_NAME        = 'my-app'
-        IMAGE_TAG         = "${env.BUILD_NUMBER}"
-        SONARQUBE_ENV     = 'MySonarQubeServer'      // Configured in Manage Jenkins > System
-        SLACK_CHANNEL     = '#ci-cd-notifications'
-        EMAIL_RECIPIENTS  = 'devops-team@example.com'
-        DEV_NAMESPACE     = 'dev'
-        PREPROD_NAMESPACE = 'preprod'
-        PROD_NAMESPACE    = 'prod'
+        // --- Git / GitLab ---
+        GIT_REPO_URL       = 'git@gitlab.com:your-group/your-app.git'
+
+        // --- Docker / Registry ---
+        DOCKER_REGISTRY    = 'registry.example.com'
+        IMAGE_NAME         = 'your-app'
+        IMAGE_TAG          = "${env.BUILD_NUMBER}-${params.DEPLOY_ENV}"
+        FULL_IMAGE         = "${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+        // --- Deployment target (per environment, resolved at runtime) ---
+        DEPLOY_SERVER      = credentials('deploy-server-host')   // e.g. user@10.0.0.5, stored as Secret text
+        CONTAINER_NAME     = "your-app-${params.DEPLOY_ENV}"
+        HOST_PORT          = '8080'
+        CONTAINER_PORT     = '8080'
+        HEALTHCHECK_URL    = "http://localhost:${HOST_PORT}/health"
+
+        // --- SonarQube ---
+        SONAR_PROJECT_KEY  = 'your-app'
+
+        // --- Credentials IDs (configured in Jenkins Credentials store) ---
+        DOCKER_CREDS_ID    = 'docker-registry-creds'
+        SSH_CREDS_ID       = 'deploy-server-ssh-key'
+        SONAR_TOKEN_ID     = 'sonarqube-token'
+        SLACK_CREDS_ID     = 'slack-webhook-url'
     }
 
+    // Keep only the last 15 builds/artifacts to avoid disk bloat,
+    // and timeout any single run that hangs (e.g. a stuck SSH session).
     options {
-        timestamps()                                  // Add timestamps to console log
-        buildDiscarder(logRotator(numToKeepStr: '20')) // Keep last 20 builds
-        disableConcurrentBuilds()                      // Avoid parallel pipeline runs
-        timeout(time: 60, unit: 'MINUTES')             // Global pipeline timeout
-    }
-
-    triggers {
-        // Jenkins Trigger: fires automatically when a Merge/Pull Request
-        // is created or updated (configure webhook in Git provider).
-        // Alternative: pollSCM('H/5 * * * *') if webhooks are unavailable.
-        githubPush()
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        ansiColor('xterm')
     }
 
     stages {
 
-        // ------------------------------------------------------------------
-        // STAGE: Checkout
-        // Pulls the source code from the Git repository / branch that
-        // triggered the build (post Code Review / Merge Request approval).
-        // ------------------------------------------------------------------
-        stage('Checkout') {
+        // ===========================================================
+        // STAGE 1: Checkout Code
+        // Pulls the exact commit that triggered the webhook.
+        // ===========================================================
+        stage('Checkout Code') {
             steps {
-                echo "Checking out source code..."
-                checkout scm
+                echo "Checking out branch: ${params.BRANCH_NAME}"
+                git branch: "${params.BRANCH_NAME}",
+                    url: "${env.GIT_REPO_URL}",
+                    credentialsId: 'gitlab-ssh-key'
             }
         }
 
-        // ------------------------------------------------------------------
-        // STAGE: Build
-        // Compiles the source code / installs dependencies and produces
-        // build artifacts.
-        // ------------------------------------------------------------------
-        stage('Build') {
+        // ===========================================================
+        // STAGE 2: Read Parameters
+        // Just surfaces what this run is doing, for audit/log clarity.
+        // Real "reading" already happened via `parameters {}` above —
+        // this stage is where you'd add extra validation logic.
+        // ===========================================================
+        stage('Read Parameters') {
             steps {
-                echo "Building application..."
-                sh 'mvn clean compile'
+                script {
+                    echo """
+                    ==== Pipeline Run Parameters ====
+                    Branch      : ${params.BRANCH_NAME}
+                    Environment : ${params.DEPLOY_ENV}
+                    Skip Tests  : ${params.SKIP_TESTS}
+                    Image Tag   : ${env.IMAGE_TAG}
+                    ==================================
+                    """
+                    // Example guardrail: refuse to deploy 'main' branch
+                    // straight to 'dev' environment, etc. Customize as needed.
+                    if (params.DEPLOY_ENV == 'main' && params.BRANCH_NAME != 'main') {
+                        error("Refusing to deploy non-main branch to the main environment.")
+                    }
+                }
             }
         }
 
-        // ------------------------------------------------------------------
-        // STAGE: Unit Test
-        // Runs automated unit tests and publishes test results/coverage.
-        // ------------------------------------------------------------------
-        stage('Unit Test') {
+        // ===========================================================
+        // STAGE 3: Build Application
+        // Swap this block for your stack (mvn package, go build, etc.)
+        // ===========================================================
+        stage('Build Application') {
             steps {
-                echo "Running unit tests..."
-                sh 'mvn test'
+                sh '''
+                    echo "Installing dependencies and building..."
+                    npm ci
+                    npm run build
+                '''
+            }
+        }
+
+        // ===========================================================
+        // STAGE 4: Run Unit Tests
+        // Publishes JUnit-style results so Jenkins shows pass/fail
+        // trends. Skippable via the SKIP_TESTS param for emergencies.
+        // ===========================================================
+        stage('Run Unit Tests') {
+            when {
+                expression { return !params.SKIP_TESTS }
+            }
+            steps {
+                sh '''
+                    echo "Running unit tests..."
+                    npm test -- --ci --reporters=default --reporters=jest-junit
+                '''
             }
             post {
                 always {
-                    junit '**/target/surefire-reports/*.xml'
+                    junit testResults: '**/junit.xml', allowEmptyResults: true
                 }
             }
         }
 
-        // ------------------------------------------------------------------
-        // STAGE: SonarQube
-        // Performs static code analysis for code quality, bugs, and
-        // code smells; optionally waits for the Quality Gate result.
-        // ------------------------------------------------------------------
-        stage('SonarQube') {
+        // ===========================================================
+        // STAGE 5: SonarQube Analysis
+        // Static code quality/coverage scan. Waits for the Quality
+        // Gate webhook result before letting the pipeline continue.
+        // ===========================================================
+        stage('SonarQube Analysis') {
             steps {
-                echo "Running SonarQube analysis..."
-                withSonarQubeEnv("${SONARQUBE_ENV}") {
-                    sh 'mvn sonar:sonar'
+                withSonarQubeEnv('SonarQubeServer') {
+                    sh """
+                        sonar-scanner \
+                          -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} \
+                          -Dsonar.sources=. \
+                          -Dsonar.login=\$SONAR_TOKEN
+                    """
                 }
             }
         }
-
         stage('Quality Gate') {
             steps {
+                // Fails the build automatically if Sonar's Quality Gate fails.
                 timeout(time: 10, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: true
                 }
             }
         }
 
-        // ------------------------------------------------------------------
-        // STAGE: Security Scan
-        // Scans source code / dependencies / container images for known
-        // vulnerabilities (e.g. Trivy, Snyk, OWASP Dependency-Check).
-        // ------------------------------------------------------------------
+        // ===========================================================
+        // STAGE 6: Security Scan
+        // Example uses Trivy against the filesystem/deps. Swap for
+        // Snyk, OWASP Dependency-Check, etc. Fails on HIGH/CRITICAL.
+        // ===========================================================
         stage('Security Scan') {
             steps {
-                echo "Running security scan..."
-                sh 'dependency-check.sh --project my-app --scan . || true'
-                // Replace with Trivy/Snyk/etc. as per your org's tooling
+                sh '''
+                    echo "Running dependency & filesystem security scan..."
+                    trivy fs --severity HIGH,CRITICAL --exit-code 1 .
+                '''
             }
         }
 
-        // ------------------------------------------------------------------
-        // STAGE: Docker Build
-        // Builds the Docker image for the application using the Dockerfile
-        // in the repository root (adjust path as needed).
-        // ------------------------------------------------------------------
+        // ===========================================================
+        // STAGE 7: Docker Build
+        // ===========================================================
         stage('Docker Build') {
             steps {
-                echo "Building Docker image..."
-                sh "docker build -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} ."
+                echo "Building image ${env.FULL_IMAGE}"
+                sh "docker build -t ${env.FULL_IMAGE} ."
             }
         }
 
-        // ------------------------------------------------------------------
-        // STAGE: Docker Push
-        // Pushes the built Docker image to the container registry.
-        // ------------------------------------------------------------------
+        // ===========================================================
+        // STAGE 8: Docker Push
+        // Logs into the registry with stored credentials, pushes,
+        // then logs out so the token doesn't linger on the agent.
+        // ===========================================================
         stage('Docker Push') {
             steps {
-                echo "Pushing Docker image to registry..."
-                withCredentials([usernamePassword(credentialsId: 'docker-registry-creds',
-                                                   usernameVariable: 'DOCKER_USER',
-                                                   passwordVariable: 'DOCKER_PASS')]) {
+                withCredentials([usernamePassword(
+                    credentialsId: env.DOCKER_CREDS_ID,
+                    usernameVariable: 'REG_USER',
+                    passwordVariable: 'REG_PASS'
+                )]) {
                     sh """
-                        echo \$DOCKER_PASS | docker login ${DOCKER_REGISTRY} -u \$DOCKER_USER --password-stdin
-                        docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                        echo "\$REG_PASS" | docker login ${env.DOCKER_REGISTRY} -u "\$REG_USER" --password-stdin
+                        docker push ${env.FULL_IMAGE}
+                        docker logout ${env.DOCKER_REGISTRY}
                     """
                 }
             }
         }
 
-        // ------------------------------------------------------------------
-        // STAGE: Deploy DEV
-        // Deploys the newly built image to the DEV environment.
-        // ------------------------------------------------------------------
-        stage('Deploy DEV') {
+        // ===========================================================
+        // STAGE 9: SSH to Deployment Server + Deploy
+        // Pulls the new image, stops/removes the old container, runs
+        // the new one, then waits and checks health.
+        // The heavy lifting lives in scripts/deploy.sh (see below) so
+        // this stage stays short and the logic is testable/reusable.
+        // ===========================================================
+        stage('Deploy to Server') {
             steps {
-                echo "Deploying to DEV environment..."
-                sh "kubectl set image deployment/my-app my-app=${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} -n ${DEV_NAMESPACE}"
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // STAGE: Health Check (DEV)
-        // Verifies the DEV deployment is up and responding before
-        // proceeding to QA Approval.
-        // ------------------------------------------------------------------
-        stage('Health Check - DEV') {
-            steps {
-                echo "Checking DEV environment health..."
-                script {
-                    def status = sh(script: "curl -s -o /dev/null -w '%{http_code}' https://dev.example.com/health", returnStdout: true).trim()
-                    if (status != '200') {
-                        error "DEV health check failed with status: ${status}"
-                    }
+                sshagent(credentials: [env.SSH_CREDS_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${env.DEPLOY_SERVER} '
+                            bash -s' < scripts/deploy.sh \
+                            ${env.FULL_IMAGE} \
+                            ${env.CONTAINER_NAME} \
+                            ${env.HOST_PORT} \
+                            ${env.CONTAINER_PORT}
+                    """
                 }
             }
         }
 
-        // ------------------------------------------------------------------
-        // STAGE: QA Approval
-        // Manual gate - a QA engineer reviews the DEV deployment and
-        // approves promotion to PREPROD.
-        // ------------------------------------------------------------------
-        stage('QA Approval') {
+        // ===========================================================
+        // STAGE 10: Health Check
+        // Polls the app's /health endpoint after deploy. If it never
+        // returns 200 within the timeout, mark this stage (and thus
+        // the pipeline) as FAILED so the post{} block can roll back.
+        // ===========================================================
+        stage('Health Check') {
             steps {
-                timeout(time: 24, unit: 'HOURS') {
-                    input message: "QA: Approve promotion to PREPROD?", ok: 'Approve'
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // STAGE: Deploy PREPROD
-        // Deploys the image to the PREPROD (staging) environment.
-        // ------------------------------------------------------------------
-        stage('Deploy PREPROD') {
-            steps {
-                echo "Deploying to PREPROD environment..."
-                sh "kubectl set image deployment/my-app my-app=${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} -n ${PREPROD_NAMESPACE}"
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // STAGE: Health Check (PREPROD)
-        // Verifies the PREPROD deployment is healthy before requesting
-        // Manager Approval for production release.
-        // ------------------------------------------------------------------
-        stage('Health Check - PREPROD') {
-            steps {
-                echo "Checking PREPROD environment health..."
-                script {
-                    def status = sh(script: "curl -s -o /dev/null -w '%{http_code}' https://preprod.example.com/health", returnStdout: true).trim()
-                    if (status != '200') {
-                        error "PREPROD health check failed with status: ${status}"
-                    }
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // STAGE: Manager Approval
-        // Manual gate - final sign-off from a manager/release owner
-        // before deploying to PRODUCTION.
-        // ------------------------------------------------------------------
-        stage('Manager Approval') {
-            steps {
-                timeout(time: 24, unit: 'HOURS') {
-                    input message: "Manager: Approve deployment to PRODUCTION?", ok: 'Approve'
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // STAGE: Deploy PROD
-        // Deploys the image to the PRODUCTION environment.
-        // ------------------------------------------------------------------
-        stage('Deploy PROD') {
-            steps {
-                echo "Deploying to PRODUCTION environment..."
-                sh "kubectl set image deployment/my-app my-app=${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} -n ${PROD_NAMESPACE}"
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // STAGE: Health Check (PROD)
-        // Final verification that PRODUCTION is healthy post-deployment.
-        // If this fails, the 'Rollback' logic in post{} is triggered.
-        // ------------------------------------------------------------------
-        stage('Health Check - PROD') {
-            steps {
-                echo "Checking PRODUCTION environment health..."
-                script {
-                    def status = sh(script: "curl -s -o /dev/null -w '%{http_code}' https://prod.example.com/health", returnStdout: true).trim()
-                    if (status != '200') {
-                        error "PROD health check failed with status: ${status}"
-                    }
+                sshagent(credentials: [env.SSH_CREDS_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${env.DEPLOY_SERVER} '
+                            for i in \$(seq 1 10); do
+                                if curl -sf ${env.HEALTHCHECK_URL} > /dev/null; then
+                                    echo "Health check passed"
+                                    exit 0
+                                fi
+                                echo "Waiting for app to become healthy... (\$i/10)"
+                                sleep 5
+                            done
+                            echo "Health check failed after 10 attempts"
+                            exit 1
+                        '
+                    """
                 }
             }
         }
     }
 
-    // ------------------------------------------------------------------
-    // POST-BUILD ACTIONS
-    // Handles Rollback (only if a prior stage/health check failed) and
-    // sends Slack / Email notifications for every build outcome.
-    // ------------------------------------------------------------------
+    // ===============================================================
+    // POST — runs after all stages, regardless of outcome.
+    //   success -> notify success (Slack/email)
+    //   failure -> rollback the deployment, then notify failure
+    // This is what implements the branch at the bottom of the diagram.
+    // ===============================================================
     post {
+        success {
+            echo "Pipeline succeeded — notifying team."
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: "✅ *${env.JOB_NAME}* #${env.BUILD_NUMBER} deployed to *${params.DEPLOY_ENV}* successfully.\n${env.FULL_IMAGE}"
+            )
+            emailext(
+                to: 'devops-team@example.com',
+                subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: "Deployment of ${env.FULL_IMAGE} to ${params.DEPLOY_ENV} succeeded."
+            )
+        }
 
-        // ROLLBACK: triggered automatically only when the pipeline
-        // fails at or after the PROD deployment stage.
         failure {
+            echo "Pipeline failed — attempting automatic rollback."
             script {
-                if (env.STAGE_NAME == 'Health Check - PROD' || env.STAGE_NAME == 'Deploy PROD') {
-                    echo "Production failure detected - rolling back..."
-                    sh "kubectl rollout undo deployment/my-app -n ${PROD_NAMESPACE}"
+                sshagent(credentials: [env.SSH_CREDS_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${env.DEPLOY_SERVER} '
+                            bash -s' < scripts/rollback.sh ${env.CONTAINER_NAME}
+                    """
                 }
             }
-            slackSend(channel: "${SLACK_CHANNEL}", color: 'danger',
-                      message: "❌ Pipeline FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER} at stage '${env.STAGE_NAME}'. ${env.BUILD_URL}")
-            emailext(to: "${EMAIL_RECIPIENTS}",
-                      subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                      body: "Pipeline failed at stage: ${env.STAGE_NAME}. Check console output: ${env.BUILD_URL}")
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ *${env.JOB_NAME}* #${env.BUILD_NUMBER} failed for *${params.DEPLOY_ENV}*. Rolled back to previous container. Check Jenkins logs."
+            )
+            emailext(
+                to: 'devops-team@example.com',
+                subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: "Deployment of ${env.FULL_IMAGE} to ${params.DEPLOY_ENV} failed and was rolled back. See: ${env.BUILD_URL}"
+            )
         }
 
-        // SUCCESS: notify that the full pipeline (through PROD) succeeded.
-        success {
-            slackSend(channel: "${SLACK_CHANNEL}", color: 'good',
-                      message: "✅ Pipeline SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} deployed to PROD. ${env.BUILD_URL}")
-            emailext(to: "${EMAIL_RECIPIENTS}",
-                      subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                      body: "Pipeline completed successfully and deployed to PROD. ${env.BUILD_URL}")
-        }
-
-        // ALWAYS: runs regardless of outcome - good place for cleanup.
+        // Always clean the workspace and dangling local images so the
+        // Jenkins agent's disk doesn't fill up over time.
         always {
-            echo "Pipeline finished with status: ${currentBuild.currentResult}"
-            sh 'docker logout || true'
+            sh 'docker image prune -f || true'
+            cleanWs()
         }
     }
 }
