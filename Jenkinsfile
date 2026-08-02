@@ -23,10 +23,9 @@ pipeline {
     // Global tools & environment variables - adjust names/paths as per
     // your Jenkins Global Tool Configuration and organization standards.
     // --------------------------------------------------------------------
-   tools {
+tools {
     jdk 'JDK-17'
 }
-
     environment {
         DOCKER_REGISTRY   = 'registry.example.com'
         IMAGE_NAME        = 'my-app'
